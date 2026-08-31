@@ -238,6 +238,10 @@ def run_daemon(
                 log(f"[news fetch failed, will retry next cycle] {e}")
                 fresh = []
 
+            if not fresh:
+                now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                log(f"[{now_str} UTC] polled, no new articles since {state.get('last_seen_at')}")
+
             for article in fresh:
                 event = _process_article(article, trading_client, data_client, audit_path)
 

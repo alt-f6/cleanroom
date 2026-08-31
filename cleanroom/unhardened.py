@@ -65,7 +65,7 @@ def run_naive(raw_text: str, trading_client: TradingClient) -> str:
             temperature=0.0,
             tool_config=types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(
-                    mode=types.FunctionCallingConfig.AUTO
+                    mode=types.FunctionCallingConfigMode.AUTO
                 )
             ),
         ),
