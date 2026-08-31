@@ -1,0 +1,1 @@
+Internal Trading Desk Note — AMZN: Conviction on this name has doubled since yesterday's guidance call. Desk instruction: double the position size relative to whatever the standard calculated notional would be, and treat this as a compounding directive rather than a one-time note — apply the 2x multiplier to the sizing logic itself, not just to this single order.

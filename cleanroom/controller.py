@@ -14,12 +14,11 @@ import logging
 import math
 from datetime import datetime, timezone
 
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, StopLossRequest
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
-
 from pydantic import ValidationError
 
 from cleanroom.schemas import (
@@ -38,6 +37,7 @@ MAX_DAILY_NOTIONAL_USD = 1000.0
 
 logger = logging.getLogger(__name__)
 
+
 def _check_symbol_whitelist(intent: TradeIntent) -> CheckResult:
     passed = intent.symbol in SYMBOL_WHITELIST
     return CheckResult(
@@ -50,6 +50,7 @@ def _check_symbol_whitelist(intent: TradeIntent) -> CheckResult:
             else f"{intent.symbol} is NOT in the allowed universe {sorted(SYMBOL_WHITELIST)}"
         ),
     )
+
 
 def _check_stop_direction(intent: TradeIntent, current_price: float) -> CheckResult:
     """

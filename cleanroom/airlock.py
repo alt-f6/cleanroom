@@ -13,13 +13,11 @@ against reality. AIRLOCK's only responsibilities: normalize, tag, quarantine
 """
 from __future__ import annotations
 
-import re
-
 from cleanroom.schemas import (
-    AirlockedPerception, 
+    AirlockedPerception,
     ExtractedClaim,
     PerceptionOutput,
-    Provenance
+    Provenance,
 )
 
 # Keyword markers associated with known injection patterns from the attack
@@ -46,6 +44,7 @@ _INJECTION_MARKERS = (
 # flagging (e.g. "stock will rise 300%") — not blocked here, just surfaced.
 _PCT_MOVE_ANOMALY_THRESHOLD = 100.0
 
+
 def _flag_claim_anomalies(claims: list[ExtractedClaim]) -> list[str]:
     flags: list[str] = []
     for c in claims:
@@ -57,6 +56,7 @@ def _flag_claim_anomalies(claims: list[ExtractedClaim]) -> list[str]:
                 )
     return flags
 
+
 def _flag_symbol_entity_mismatch(payload: PerceptionOutput) -> list[str]:
     flags: list[str] = []
     if not payload.symbols and payload.entities:
@@ -65,6 +65,7 @@ def _flag_symbol_entity_mismatch(payload: PerceptionOutput) -> list[str]:
             "content may be off-topic or non-actionable"
         )
     return flags
+
 
 def _flag_injection_markers(payload: PerceptionOutput) -> list[str]:
     """

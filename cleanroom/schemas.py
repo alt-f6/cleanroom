@@ -3,10 +3,11 @@ Data contracts across trust boundaries.
 Plane transitions occur strictly via validated schemas, never raw text.
 """
 from __future__ import annotations
-from enum import Enum
-from datetime import datetime, timezone
-import uuid
+
 import re
+import uuid
+from datetime import datetime, timezone
+from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 

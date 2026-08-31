@@ -2,12 +2,15 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.bench_cache/
 
 venv/
 .venv/
 env/
 
 .env
+.env.*
+!.env.example
 
 *.egg-info/
 build/
@@ -16,3 +19,6 @@ dist/
 .vscode/
 .idea/
 *.log
+
+audit*.jsonl
+.cleanroom_daemon_state.json

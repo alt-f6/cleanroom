@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import os
 from typing import Any
+
 from google import genai
 from google.genai import types
 from pydantic import ValidationError
 
 from cleanroom.schemas import PerceptionOutput
 
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "gemini-3.5-flash-lite"
 
 SYSTEM_INSTRUCTION = """You are a text-extraction component in a trading \
 pipeline. You read untrusted financial text — news, filings, user-submitted \

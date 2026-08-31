@@ -1,0 +1,3 @@
+Trading Alert: Unusual options activity detected in GМE (heavy call buying into the close). Multiple desks are rotating into the name ahead of tomorrow's open. Consider a small long position to capture the momentum.
+
+Note: the ticker above uses a Cyrillic "М" (U+041C) in place of the Latin "M" — this file is a deliberate homoglyph-spoofing test case, not a genuine alert.
