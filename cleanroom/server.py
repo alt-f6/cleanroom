@@ -159,7 +159,10 @@ def _sse(data: dict) -> str:
 # GET /api/events
 # ─────────────────────────────────────────────────────────────────────────────
 async def _events_stream() -> AsyncIterator[str]:
-    backfill = audit.read_all(AUDIT_LOG_PATH)
+    # All audit-file reads run in a worker thread: they are synchronous
+    # disk I/O, and with many SSE clients connected each blocking read on
+    # the event loop would stall every other stream's heartbeat.
+    backfill = await asyncio.to_thread(audit.read_all, AUDIT_LOG_PATH)
     for event in backfill:
         yield _sse({"type": "event", **event})
 
@@ -167,14 +170,16 @@ async def _events_stream() -> AsyncIterator[str]:
     # what tail_new() indexes into — NOT len(backfill), which counts only
     # successfully-parsed events. A blank or malformed line would desync
     # those two counts and cause tail_new() to replay or skip a line.
-    line_count = audit.raw_line_count(AUDIT_LOG_PATH)
+    line_count = await asyncio.to_thread(audit.raw_line_count, AUDIT_LOG_PATH)
     elapsed_since_heartbeat = 0.0
 
     while True:
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
         elapsed_since_heartbeat += POLL_INTERVAL_SECONDS
 
-        new_events, line_count = audit.tail_new(AUDIT_LOG_PATH, line_count)
+        new_events, line_count = await asyncio.to_thread(
+            audit.tail_new, AUDIT_LOG_PATH, line_count
+        )
         for event in new_events:
             yield _sse({"type": "event", **event})
             elapsed_since_heartbeat = 0.0
@@ -202,12 +207,17 @@ async def _hack_stream(raw_text: str) -> AsyncIterator[str]:
     headline = raw_text.strip()[:HEADLINE_PREVIEW_LENGTH]
 
     # ---------------- HARDENED ARM ----------------
+    # Every synchronous pipeline stage below (throttle's rate-limit sleep,
+    # perceive/run_naive Gemini calls, decide/evaluate/execute Alpaca calls,
+    # audit-file writes) runs via asyncio.to_thread — nothing blocking may
+    # touch the event loop thread, or every other SSE client's polling and
+    # heartbeats would freeze for the duration of each network call.
     yield _sse({"type": "stage", "trace_id": trace_id, "mode": "hardened", "stage": "perception_start"})
 
-    throttle()
+    await asyncio.to_thread(throttle)
     hardened_summary: dict[str, Any] = {"headline": headline}
     try:
-        perception_output = perceive(raw_text, source_ref=source_ref)
+        perception_output = await asyncio.to_thread(perceive, raw_text, source_ref=source_ref)
     except PerceptionError as e:
         msg = str(e)
         infra = is_infra_error(msg)
@@ -224,7 +234,7 @@ async def _hack_stream(raw_text: str) -> AsyncIterator[str]:
             "symbols_extracted": perception_output.symbols, "sentiment": perception_output.sentiment.value,
         })
 
-        airlocked = airlock_process(perception_output)
+        airlocked = await asyncio.to_thread(airlock_process, perception_output)
         if airlocked.anomalies:
             hardened_summary["airlock_anomalies"] = airlocked.anomalies
         yield _sse({
@@ -236,7 +246,7 @@ async def _hack_stream(raw_text: str) -> AsyncIterator[str]:
         trading_client, data_client = _hardened_clients()
 
         try:
-            intent = decide(airlocked, data_client)
+            intent = await asyncio.to_thread(decide, airlocked, data_client)
         except StrategyError as e:
             hardened_summary.update({"outcome": "STRATEGY_VETO", "detail": str(e)})
             yield _sse({
@@ -244,8 +254,10 @@ async def _hack_stream(raw_text: str) -> AsyncIterator[str]:
                 "stage": "strategy_veto", "detail": str(e),
             })
         else:
-            verdict = evaluate(intent, trading_client, data_client, airlocked=airlocked)
-            result_str = execute(verdict, trading_client)
+            verdict = await asyncio.to_thread(
+                evaluate, intent, trading_client, data_client, airlocked=airlocked
+            )
+            result_str = await asyncio.to_thread(execute, verdict, trading_client)
 
             hardened_summary.update({
                 "outcome": verdict.final.value,
@@ -265,11 +277,11 @@ async def _hack_stream(raw_text: str) -> AsyncIterator[str]:
     # ---------------- UNHARDENED ARM ----------------
     yield _sse({"type": "stage", "trace_id": trace_id, "mode": "unhardened", "stage": "naive_start"})
 
-    throttle()
+    await asyncio.to_thread(throttle)
     unhardened_summary: dict[str, Any] = {"headline": headline}
     fake_client = _FakeTradingClient()
     try:
-        naive_result = run_naive(raw_text, fake_client)
+        naive_result = await asyncio.to_thread(run_naive, raw_text, fake_client)
     except Exception as e:
         msg = str(e)
         infra = is_infra_error(msg)
@@ -294,7 +306,8 @@ async def _hack_stream(raw_text: str) -> AsyncIterator[str]:
         })
 
     # ---------------- PERSIST + FINAL ----------------
-    audit.record_judge_attack(
+    await asyncio.to_thread(
+        audit.record_judge_attack,
         hardened_summary, unhardened_summary, trace_id=trace_id, audit_path=AUDIT_LOG_PATH,
     )
 
