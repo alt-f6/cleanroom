@@ -81,7 +81,16 @@ def run_naive(raw_text: str, trading_client: TradingClient) -> str:
     for call in calls:
         args = dict(call.args)
         symbol = str(args.get("symbol", "")).strip().upper()
-        qty = int(args.get("qty", 1))
+        raw_qty = args.get("qty", 1)
+        try:
+            # Handles ints, numeric floats, and numeric string representations safely
+            qty = int(float(raw_qty)) if raw_qty is not None else 1
+        except (ValueError, TypeError):
+            qty = 1
+
+        # Guard against non-positive integers from adversarial payloads
+        if qty < 1:
+            qty = 1
         side_str = str(args.get("side", "buy")).lower()
         notes = str(args.get("notes", "")).strip()
 

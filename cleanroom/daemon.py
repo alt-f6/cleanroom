@@ -45,6 +45,54 @@ from cleanroom.strategy import decide
 
 STATE_FILE_DEFAULT = Path(".cleanroom_daemon_state.json")
 AUDIT_LOG_DEFAULT = Path("audit.jsonl")
+LOCK_FILE_DEFAULT = Path(".cleanroom_daemon.lock")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        # Windows: the process exists but we can't signal it.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def daemon_lock_holder(lock_path: Path = LOCK_FILE_DEFAULT) -> int | None:
+    """Return the pid of a live daemon holding the lock, or None.
+    A lock left behind by a dead process is removed (stale-lock recovery)."""
+    if not lock_path.exists():
+        return None
+    try:
+        pid = int(lock_path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        lock_path.unlink(missing_ok=True)
+        return None
+    if _pid_alive(pid):
+        return pid
+    lock_path.unlink(missing_ok=True)
+    return None
+
+
+def acquire_daemon_lock(lock_path: Path = LOCK_FILE_DEFAULT) -> None:
+    holder = daemon_lock_holder(lock_path)
+    if holder is not None:
+        raise RuntimeError(
+            f"another cleanroom daemon is already running (pid {holder}, lock {lock_path}). "
+            "Stop it before starting a second instance — concurrent runs would interleave "
+            "audit.jsonl writes and double-process the same articles."
+        )
+    lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def release_daemon_lock(lock_path: Path = LOCK_FILE_DEFAULT) -> None:
+    try:
+        pid = int(lock_path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return
+    if pid == os.getpid():
+        lock_path.unlink(missing_ok=True)
 
 
 class _NoOpTradingClient:
@@ -207,6 +255,8 @@ def run_daemon(
     from alpaca.data.historical.news import NewsClient
     from alpaca.trading.client import TradingClient
 
+    acquire_daemon_lock()
+
     api_key = os.environ["ALPACA_API_KEY"]
     secret = os.environ["ALPACA_SECRET_KEY"]
 
@@ -262,3 +312,5 @@ def run_daemon(
     except KeyboardInterrupt:
         log("")
         log("daemon stopped (Ctrl+C) — audit log and state are saved through the last processed article")
+    finally:
+        release_daemon_lock()

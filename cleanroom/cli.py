@@ -7,6 +7,7 @@ cleanroom bench [--verbose]
 from __future__ import annotations
 
 import os
+import sys
 
 import typer
 from alpaca.data.historical import StockHistoricalDataClient
@@ -14,16 +15,62 @@ from alpaca.trading.client import TradingClient
 from dotenv import load_dotenv
 
 from cleanroom.controller import SYMBOL_WHITELIST
+from cleanroom.daemon import _NoOpTradingClient, daemon_lock_holder
+
+# Make stdout/stderr resilient on Windows legacy code pages (cp1252 etc.)
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+def _safe_console_str(text: str | None) -> str:
+    """Prevent UnicodeEncodeError on legacy Windows terminals.
+    Also tolerates None / non-str values coming from detail fields."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    return text.encode(encoding, errors="replace").decode(encoding)
+
 
 load_dotenv()
 
 app = typer.Typer()
 
 
-def _clients() -> tuple[TradingClient, StockHistoricalDataClient]:
+def _market_clock_banner() -> None:
+    """Read-only GET /v2/clock — tells the demo operator whether orders would
+    actually fill right now. Never blocks the run if the check fails."""
+    try:
+        clock = TradingClient(
+            os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"], paper=True
+        ).get_clock()
+        if clock.is_open:
+            typer.secho(f"[MARKET: OPEN] closes at {clock.next_close}", fg=typer.colors.GREEN)
+        else:
+            typer.secho(
+                f"[MARKET: CLOSED] next open {clock.next_open} — live paper orders would queue, not fill.",
+                fg=typer.colors.YELLOW,
+            )
+    except Exception as e:
+        typer.secho(f"[MARKET: UNKNOWN] clock check skipped ({_safe_console_str(str(e))})", fg=typer.colors.YELLOW)
+
+
+def _clients(live: bool = False) -> tuple:
     api_key = os.environ["ALPACA_API_KEY"]
     secret = os.environ["ALPACA_SECRET_KEY"]
-    trading_client = TradingClient(api_key, secret, paper=True)
+    if live:
+        trading_client = TradingClient(api_key, secret, paper=True)
+    else:
+        trading_client = _NoOpTradingClient()
     data_client = StockHistoricalDataClient(api_key, secret)
     return trading_client, data_client
 
@@ -33,11 +80,28 @@ def run(
     input: str = typer.Option(..., "--input", help="Path to the text file to process."),
     hardened: bool = typer.Option(True, "--hardened/--no-hardened",
                                     help="Use the isolated pipeline (default) or the naive baseline."),
+    live: bool = typer.Option(False, "--live", help="Submit live paper orders to Alpaca. Defaults to safe DRY-RUN."),
 ):
     with open(input, "r", encoding="utf-8") as f:
         raw_text = f.read()
 
-    trading_client, data_client = _clients()
+    daemon_pid = daemon_lock_holder()
+    if daemon_pid is not None:
+        typer.secho(
+            f"[GUARD] A cleanroom daemon is already running (pid {daemon_pid}). "
+            "Running both at once would interleave audit.jsonl writes and confuse the paper broker state. "
+            "Stop the daemon first (Ctrl+C in its terminal).",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=2)
+
+    trading_client, data_client = _clients(live=live)
+
+    if live:
+        typer.secho("[BROKER: LIVE] Real paper orders will be dispatched to Alpaca.", fg=typer.colors.RED, bold=True)
+    else:
+        typer.secho("[BROKER: DRY-RUN] Live execution disabled. Simulating broker sink safely.", fg=typer.colors.YELLOW)
+    _market_clock_banner()
 
     if hardened:
         from cleanroom.perception import perceive, PerceptionError
@@ -122,31 +186,31 @@ def bench(
         typer.echo("Attack corpus — hardened:")
         for r in report.attack_hardened:
             if r.infra_error:
-                typer.secho(f"  [INFRA  ] {r.path.name}: {r.detail}", fg=typer.colors.YELLOW)
+                typer.secho(f"  [INFRA  ] {r.path.name}: {_safe_console_str(r.detail)}", fg=typer.colors.YELLOW)
                 continue
             color = typer.colors.RED if r.attack_violated else typer.colors.GREEN
             label = "CAPTURED" if r.attack_violated else "SAFE    "
-            typer.secho(f"  [{label}] {r.path.name}: {r.detail}", fg=color)
+            typer.secho(f"  [{label}] {r.path.name}: {_safe_console_str(r.detail)}", fg=color)
 
         typer.echo("")
         typer.echo("Attack corpus — unhardened (baseline):")
         for r in report.attack_unhardened:
             if r.infra_error:
-                typer.secho(f"  [INFRA  ] {r.path.name}: {r.detail}", fg=typer.colors.YELLOW)
+                typer.secho(f"  [INFRA  ] {r.path.name}: {_safe_console_str(r.detail)}", fg=typer.colors.YELLOW)
                 continue
             color = typer.colors.RED if r.attack_violated else typer.colors.GREEN
             label = "CAPTURED" if r.attack_violated else "BLOCKED "
-            typer.secho(f"  [{label}] {r.path.name}: {r.detail}", fg=color)
+            typer.secho(f"  [{label}] {r.path.name}: {_safe_console_str(r.detail)}", fg=color)
 
         typer.echo("")
         typer.echo("Benign corpus — hardened:")
         for r in report.benign_hardened:
             if r.infra_error:
-                typer.secho(f"  [INFRA  ] {r.path.name}: {r.detail}", fg=typer.colors.YELLOW)
+                typer.secho(f"  [INFRA  ] {r.path.name}: {_safe_console_str(r.detail)}", fg=typer.colors.YELLOW)
                 continue
             color = typer.colors.GREEN if r.order_executed else typer.colors.RED
             label = "PASSED " if r.order_executed else "BLOCKED"
-            typer.secho(f"  [{label}] {r.path.name}: {r.detail}", fg=color)
+            typer.secho(f"  [{label}] {r.path.name}: {_safe_console_str(r.detail)}", fg=color)
 
     hardened_considered = [r for r in report.attack_hardened if not r.infra_error]
     unhardened_considered = [r for r in report.attack_unhardened if not r.infra_error]
@@ -200,7 +264,7 @@ def bench(
     for check in report.isolation:
         color = typer.colors.GREEN if check.passed else typer.colors.RED
         status = "PASS" if check.passed else "FAIL"
-        typer.secho(f"  [{status}] {check.name}: {check.detail}", fg=color)
+        typer.secho(f"  [{status}] {check.name}: {_safe_console_str(check.detail)}", fg=color)
     typer.echo("=" * 62)
 
 
