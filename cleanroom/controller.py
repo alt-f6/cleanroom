@@ -22,9 +22,11 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, StopLo
 from pydantic import ValidationError
 
 from cleanroom.schemas import (
+    AirlockedPerception,
     CheckResult,
     ControllerVerdict,
     Decision,
+    Provenance,
     Severity,
     Side,
     TradeIntent,
@@ -36,6 +38,60 @@ MAX_DAILY_ORDERS = 5
 MAX_DAILY_NOTIONAL_USD = 1000.0
 
 logger = logging.getLogger(__name__)
+
+# CheckResult.detail is capped at 300 chars; exception strings (especially
+# HTTP error bodies) routinely exceed that, and a fail-closed check must
+# never itself fail validation over the length of its own explanation.
+_DETAIL_MAX = 290
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= _DETAIL_MAX else text[: _DETAIL_MAX - 3] + "..."
+
+
+def _check_airlock_binding(intent: TradeIntent, airlocked: AirlockedPerception) -> CheckResult:
+    """The intent must provably originate from the AIRLOCK payload presented
+    alongside it: thesis_ref must equal that payload's airlock_id, and a
+    text-derived payload must still carry UNTRUSTED_TEXT provenance — a
+    payload claiming trusted provenance is spoofing, not a variation."""
+    bound = intent.thesis_ref == airlocked.airlock_id
+    provenance_ok = airlocked.provenance == Provenance.UNTRUSTED_TEXT
+    passed = bound and provenance_ok
+    if passed:
+        detail = f"intent bound to airlock_id={airlocked.airlock_id}, provenance={airlocked.provenance.value}"
+    elif not bound:
+        detail = (
+            f"thesis_ref={intent.thesis_ref!r} does not match the presented "
+            f"airlock_id={airlocked.airlock_id} — intent is not derived from this payload"
+        )
+    else:
+        detail = f"text-derived payload carries non-text provenance: {airlocked.provenance.value}"
+    return CheckResult(
+        name="AIRLOCK_BINDING",
+        passed=passed,
+        severity=Severity.BLOCK,
+        detail=_clip(detail),
+    )
+
+
+def _airlock_anomaly_audit(airlocked: AirlockedPerception) -> CheckResult:
+    """Surfaces AIRLOCK's anomaly flags in the verdict's own audit trail.
+    Deliberately WARN severity and always passed: flags are visibility, not
+    a detection gate — the security guarantee stays in the BLOCK invariants
+    (see airlock.py's note on avoiding a detection arms race)."""
+    if airlocked.anomalies:
+        detail = _clip(
+            f"{len(airlocked.anomalies)} AIRLOCK anomaly flag(s): "
+            + "; ".join(airlocked.anomalies)
+        )
+    else:
+        detail = "no AIRLOCK anomaly flags"
+    return CheckResult(
+        name="AIRLOCK_ANOMALY_AUDIT",
+        passed=True,
+        severity=Severity.WARN,
+        detail=detail,
+    )
 
 
 def _check_symbol_whitelist(intent: TradeIntent) -> CheckResult:
@@ -174,6 +230,7 @@ def _check_daily_limits(
     price_map = _get_live_prices(symbols_needing_price, data_client)
 
     notional_so_far = 0.0
+    unpriced: list[str] = []
     for o in active_orders:
         if o.notional is not None and float(o.notional) > 0:
             notional_so_far += float(o.notional)
@@ -184,7 +241,13 @@ def _check_daily_limits(
             else:
                 price = price_map.get(o.symbol, 0.0)
                 if price == 0.0:
+                    # Fail closed: an order we cannot price cannot be
+                    # counted as $0 exposure — that would silently raise
+                    # the effective daily cap by exactly the amount we
+                    # failed to observe.
                     logger.warning("Unresolved pricing for order id=%s symbol=%s", o.id, o.symbol)
+                    unpriced.append(f"id={o.id} symbol={o.symbol}")
+                    continue
             notional_so_far += qty * price
 
     count_check = CheckResult(
@@ -193,15 +256,27 @@ def _check_daily_limits(
         severity=Severity.BLOCK,
         detail=f"{order_count}/{MAX_DAILY_ORDERS} orders placed today",
     )
-    notional_check = CheckResult(
-        name="DAILY_NOTIONAL_CAP",
-        passed=(notional_so_far + intent.notional) <= MAX_DAILY_NOTIONAL_USD,
-        severity=Severity.BLOCK,
-        detail=(
-            f"today so far: ${notional_so_far:.2f}, this order: ${intent.notional:.2f}, "
-            f"cap: ${MAX_DAILY_NOTIONAL_USD:.2f}"
-        ),
-    )
+    if unpriced:
+        notional_check = CheckResult(
+            name="DAILY_NOTIONAL_CAP",
+            passed=False,
+            severity=Severity.BLOCK,
+            detail=_clip(
+                "failing closed: could not determine exposure for open order(s) "
+                + ", ".join(unpriced)
+                + " — daily notional cannot be verified against the cap"
+            ),
+        )
+    else:
+        notional_check = CheckResult(
+            name="DAILY_NOTIONAL_CAP",
+            passed=(notional_so_far + intent.notional) <= MAX_DAILY_NOTIONAL_USD,
+            severity=Severity.BLOCK,
+            detail=(
+                f"today so far: ${notional_so_far:.2f}, this order: ${intent.notional:.2f}, "
+                f"cap: ${MAX_DAILY_NOTIONAL_USD:.2f}"
+            ),
+        )
     return count_check, notional_check
 
 
@@ -247,11 +322,24 @@ def evaluate(
     intent: TradeIntent | None,
     trading_client: TradingClient,
     data_client: StockHistoricalDataClient,
+    airlocked: AirlockedPerception | None = None,
 ) -> ControllerVerdict:
     """
     The single entry point for Plane 3 decision-making. If intent is None
     (Strategy declined to propose a trade), returns an immediate PASS-shaped
     no-op verdict — there is nothing to veto if nothing was proposed.
+
+    When the caller supplies the AirlockedPerception the intent was derived
+    from, two additional checks run: AIRLOCK_BINDING (BLOCK — the intent
+    must be bound to exactly this payload, with untrusted-text provenance)
+    and AIRLOCK_ANOMALY_AUDIT (WARN — Plane 2's anomaly flags become part
+    of the verdict's permanent audit trail).
+
+    Every external call (market data, order history) is fail-closed: an
+    exception produces a failed BLOCK check — and therefore a VETO with
+    approved_notional=0 — never a raised exception. An unreachable broker
+    is indistinguishable from an unverifiable invariant, and unverifiable
+    means VETO.
     """
     if intent is None:
         return ControllerVerdict(
@@ -263,23 +351,50 @@ def evaluate(
         )
 
     checks: list[CheckResult] = []
+
+    if airlocked is not None:
+        checks.append(_check_airlock_binding(intent, airlocked))
+        checks.append(_airlock_anomaly_audit(airlocked))
+
     checks.append(_check_symbol_whitelist(intent))
 
     # Only fetch the live price and evaluate stop direction if the symbol
     # is actually whitelisted — no reason to query market data (or trust
     # any downstream check) for a symbol we're going to reject anyway.
     if checks[-1].passed:
-        request = StockLatestTradeRequest(symbol_or_symbols=intent.symbol)
-        current_price = float(
-            data_client.get_stock_latest_trade(request)[intent.symbol].price
-        )
-        checks.append(_check_stop_direction(intent, current_price))
+        try:
+            request = StockLatestTradeRequest(symbol_or_symbols=intent.symbol)
+            current_price = float(
+                data_client.get_stock_latest_trade(request)[intent.symbol].price
+            )
+        except Exception as e:
+            checks.append(CheckResult(
+                name="MARKET_DATA_AVAILABILITY",
+                passed=False,
+                severity=Severity.BLOCK,
+                detail=_clip(
+                    f"failing closed: could not fetch live price for {intent.symbol}: {e}"
+                ),
+            ))
+        else:
+            checks.append(_check_stop_direction(intent, current_price))
 
     checks.append(_check_notional_sanity(intent))
 
-    count_check, notional_check = _check_daily_limits(intent, trading_client, data_client)
-    checks.append(count_check)
-    checks.append(notional_check)
+    try:
+        count_check, notional_check = _check_daily_limits(intent, trading_client, data_client)
+    except Exception as e:
+        checks.append(CheckResult(
+            name="ORDER_HISTORY_AVAILABILITY",
+            passed=False,
+            severity=Severity.BLOCK,
+            detail=_clip(
+                f"failing closed: could not fetch today's order history: {e}"
+            ),
+        ))
+    else:
+        checks.append(count_check)
+        checks.append(notional_check)
 
     return _build_verdict(intent, checks)
 

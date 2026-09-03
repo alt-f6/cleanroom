@@ -196,20 +196,34 @@ def _perceive_with_retry(raw_text: str, source_ref: str):
 def _process_article(article, trading_client, data_client, audit_path: Path) -> dict:
     """Runs one article through the full hardened pipeline and appends a
     structured event to the audit log. Never raises — every failure mode
-    (infra error, Perception VETO, Strategy decline, Controller VETO) is
-    captured as an event rather than propagated, since one bad article
-    must not take the daemon down."""
-    headline = _get_field(article, "headline", "") or ""
-    summary = _get_field(article, "summary", "") or ""
-    raw_text = f"{headline}\n\n{summary}".strip()
-    source_ref = f"alpaca-news:{_get_field(article, 'id', 'unknown')}"
-
+    (infra error, Perception VETO, Strategy decline, Controller VETO,
+    broker submission failure, or any unanticipated exception) is captured
+    as an event rather than propagated, since one bad article must not
+    take the daemon down. The outer safety net exists precisely for the
+    failure modes the inner handlers didn't anticipate."""
     event: dict = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "news_id": _get_field(article, "id"),
         "news_created_at": _get_field(article, "created_at"),
-        "headline": headline,
+        "headline": _get_field(article, "headline", "") or "",
     }
+    try:
+        return _process_article_unsafe(article, trading_client, data_client, audit_path, event)
+    except Exception as e:
+        event["outcome"] = "PIPELINE_ERROR"
+        event["detail"] = str(e)
+        try:
+            _append_audit(audit_path, event)
+        except Exception:
+            pass  # even an unwritable audit log must not kill the daemon
+        return event
+
+
+def _process_article_unsafe(article, trading_client, data_client, audit_path: Path, event: dict) -> dict:
+    headline = event["headline"]
+    summary = _get_field(article, "summary", "") or ""
+    raw_text = f"{headline}\n\n{summary}".strip()
+    source_ref = f"alpaca-news:{_get_field(article, 'id', 'unknown')}"
 
     try:
         perception_output = _perceive_with_retry(raw_text, source_ref)
@@ -233,8 +247,18 @@ def _process_article(article, trading_client, data_client, audit_path: Path) -> 
         _append_audit(audit_path, event)
         return event
 
-    verdict = evaluate(intent, trading_client, data_client)
-    result_str = execute(verdict, trading_client)
+    verdict = evaluate(intent, trading_client, data_client, airlocked=airlocked)
+
+    try:
+        result_str = execute(verdict, trading_client)
+    except Exception as e:
+        # evaluate() is fail-closed internally, but submit_order itself can
+        # still fail after a PASS — record it rather than crash the loop.
+        event["outcome"] = "EXECUTION_ERROR"
+        event["reason"] = verdict.reason
+        event["detail"] = str(e)
+        _append_audit(audit_path, event)
+        return event
 
     event["outcome"] = verdict.final.value
     event["reason"] = verdict.reason

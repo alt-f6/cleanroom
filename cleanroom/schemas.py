@@ -104,7 +104,11 @@ class OrderType(str, Enum):
 
 
 class TradeIntent(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # frozen=True: an intent is immutable once validated. Every Field
+    # constraint (gt/le bounds) only runs at construction time, so allowing
+    # post-validation assignment would let a compromised caller re-write
+    # notional/qty between evaluate() and execute() without re-validation.
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     symbol: str = Field(pattern=r"^[A-Z]{1,5}$")
     side: Side
