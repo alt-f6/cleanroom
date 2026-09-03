@@ -47,6 +47,12 @@ STATE_FILE_DEFAULT = Path(".cleanroom_daemon_state.json")
 AUDIT_LOG_DEFAULT = Path("audit.jsonl")
 LOCK_FILE_DEFAULT = Path(".cleanroom_daemon.lock")
 
+# Dedup window: must comfortably exceed one poll's maximum article count
+# (NewsRequest limit=50), because the news API's `start` filter is treated
+# as inclusive — every article sharing the boundary timestamp comes back on
+# the next poll and only the id set keeps it from being reprocessed.
+SEEN_IDS_MAX = 200
+
 
 def _pid_alive(pid: int) -> bool:
     try:
@@ -115,13 +121,69 @@ class _NoOpTradingClient:
 
 
 def _load_state(path: Path) -> dict:
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {"last_seen_at": None, "last_seen_ids": []}
+    """Loads dedup state, tolerating a missing, corrupt, or malformed file.
+    A corrupt file degrades to the safe first-run default (start from now,
+    no backlog) rather than crashing the daemon or replaying history."""
+    default = {"last_seen_at": None, "last_seen_ids": []}
+    if not path.exists():
+        return default
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return default
+    if not isinstance(raw, dict):
+        return default
+    ids = raw.get("last_seen_ids")
+    if not isinstance(ids, list):
+        ids = []
+    last_seen_at = raw.get("last_seen_at")
+    return {
+        "last_seen_at": last_seen_at if isinstance(last_seen_at, str) else None,
+        "last_seen_ids": list(dict.fromkeys(ids))[-SEEN_IDS_MAX:],
+    }
 
 
 def _save_state(path: Path, state: dict) -> None:
-    path.write_text(json.dumps(state), encoding="utf-8")
+    """Atomic write: a crash mid-save must never leave a truncated JSON file
+    behind — the state file is the only thing standing between a restart
+    and reprocessing (re-trading) recently fetched news."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _advance_state(state: dict, article_id, created_at) -> None:
+    """Records one article in the dedup state, in memory.
+
+    - seen ids: appended, deduplicated, bounded to SEEN_IDS_MAX.
+    - last_seen_at: strictly monotonic. It advances only when the new
+      timestamp is strictly greater than the stored one; on an equal
+      timestamp the cursor stays put and the id set alone disambiguates
+      articles sharing that exact created_at. Unparseable or incomparable
+      timestamps fall back to text comparison of the ISO strings — the
+      cursor never moves backwards on an edge case.
+    """
+    if article_id is not None:
+        seen = state.get("last_seen_ids", [])
+        state["last_seen_ids"] = list(dict.fromkeys([*seen, article_id]))[-SEEN_IDS_MAX:]
+
+    if created_at is None:
+        return
+    new_iso = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+    prev_iso = state.get("last_seen_at")
+    if prev_iso is None:
+        state["last_seen_at"] = new_iso
+        return
+    try:
+        newer = _parse_iso(new_iso) > _parse_iso(prev_iso)
+    except (ValueError, TypeError):
+        newer = new_iso > prev_iso
+    if newer:
+        state["last_seen_at"] = new_iso
 
 
 def _append_audit(path: Path, event: dict) -> None:
@@ -167,8 +229,18 @@ def _fetch_new_articles(news_client, symbols: list[str], state: dict) -> list:
     else:
         articles = getattr(response, "news", response)
 
+    # Filter against BOTH the persisted seen-id window and ids already
+    # accepted from this same batch — the API can return an article twice
+    # in one response, and processing it twice would place two trades.
     seen_ids = set(state.get("last_seen_ids", []))
-    fresh = [a for a in articles if _get_field(a, "id") not in seen_ids]
+    fresh = []
+    for a in articles:
+        article_id = _get_field(a, "id")
+        if article_id is not None and article_id in seen_ids:
+            continue
+        if article_id is not None:
+            seen_ids.add(article_id)
+        fresh.append(a)
     return sorted(fresh, key=lambda a: _get_field(a, "created_at"))
 
 
@@ -317,17 +389,17 @@ def run_daemon(
                 log(f"[{now_str} UTC] polled, no new articles since {state.get('last_seen_at')}")
 
             for article in fresh:
-                event = _process_article(article, trading_client, data_client, audit_path)
-
-                created_at = _get_field(article, "created_at")
-                if created_at is not None:
-                    state["last_seen_at"] = (
-                        created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
-                    )
-                ids = [i for i in state.get("last_seen_ids", []) if i == _get_field(article, "id")]
-                ids.append(_get_field(article, "id"))
-                state["last_seen_ids"] = list(dict.fromkeys(ids))[-50:]
+                # Mark the article seen and persist BEFORE running the
+                # pipeline: if the daemon dies mid-article, a restart skips
+                # it (at-most-once trade execution) instead of re-running
+                # it against the broker — a duplicate trade is strictly
+                # worse than one missing audit line.
+                _advance_state(
+                    state, _get_field(article, "id"), _get_field(article, "created_at")
+                )
                 _save_state(state_path, state)
+
+                event = _process_article(article, trading_client, data_client, audit_path)
 
                 log(f"[{event.get('news_created_at')}] {event['outcome']:<16} "
                     f"{event.get('headline', '')[:70]}")
