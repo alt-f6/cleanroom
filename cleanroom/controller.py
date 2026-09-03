@@ -322,18 +322,21 @@ def evaluate(
     intent: TradeIntent | None,
     trading_client: TradingClient,
     data_client: StockHistoricalDataClient,
-    airlocked: AirlockedPerception | None = None,
+    airlocked: AirlockedPerception,
 ) -> ControllerVerdict:
     """
     The single entry point for Plane 3 decision-making. If intent is None
     (Strategy declined to propose a trade), returns an immediate PASS-shaped
     no-op verdict — there is nothing to veto if nothing was proposed.
 
-    When the caller supplies the AirlockedPerception the intent was derived
-    from, two additional checks run: AIRLOCK_BINDING (BLOCK — the intent
-    must be bound to exactly this payload, with untrusted-text provenance)
-    and AIRLOCK_ANOMALY_AUDIT (WARN — Plane 2's anomaly flags become part
-    of the verdict's permanent audit trail).
+    The AirlockedPerception the intent was derived from is MANDATORY. Two
+    checks run unconditionally on every intent: AIRLOCK_BINDING (BLOCK —
+    the intent must be bound to exactly this payload, with untrusted-text
+    provenance) and AIRLOCK_ANOMALY_AUDIT (WARN — Plane 2's anomaly flags
+    become part of the verdict's permanent audit trail). A caller that
+    somehow presents no valid AirlockedPerception gets a fail-closed VETO,
+    never a bypass: an intent whose provenance cannot be verified is
+    indistinguishable from a forged one.
 
     Every external call (market data, order history) is fail-closed: an
     exception produces a failed BLOCK check — and therefore a VETO with
@@ -352,7 +355,17 @@ def evaluate(
 
     checks: list[CheckResult] = []
 
-    if airlocked is not None:
+    if not isinstance(airlocked, AirlockedPerception):
+        checks.append(CheckResult(
+            name="AIRLOCK_BINDING",
+            passed=False,
+            severity=Severity.BLOCK,
+            detail=(
+                "failing closed: no AirlockedPerception presented alongside the "
+                "intent — provenance cannot be verified, unverifiable means VETO"
+            ),
+        ))
+    else:
         checks.append(_check_airlock_binding(intent, airlocked))
         checks.append(_airlock_anomaly_audit(airlocked))
 
