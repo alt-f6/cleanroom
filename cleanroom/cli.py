@@ -125,7 +125,7 @@ def run(
             typer.echo(f"AIRLOCK flagged anomalies: {airlocked.anomalies}")
 
         intent = decide(airlocked, data_client)
-        verdict = evaluate(intent, trading_client, data_client)
+        verdict = evaluate(intent, trading_client, data_client, airlocked=airlocked)
 
         typer.echo(f"Controller verdict: {verdict.final.value} — {verdict.reason}")
         for check in verdict.checks:
@@ -142,7 +142,8 @@ def run(
         typer.echo("WARNING: this path has no schema boundary, no whitelist, no stop-loss requirement.")
 
         result = run_naive(raw_text, trading_client)
-        typer.echo(result)
+        typer.echo("CAPTURED (tool dispatched)" if result.captured else "no tool dispatch")
+        typer.echo(result.detail)
 
 
 @app.command()

@@ -148,3 +148,18 @@ SSE contract (`server.py` / `frontend/lib/types.ts`, "Do not add fields that are
 - **Инварианты:** `git diff --name-only` → `controller.py`, `schemas.py`, `strategy.py` отсутствуют в диффе. ✅
 - **LLM-вызовы за сессию: 0 / 20.** Prompt-injection строки из `audit.jsonl`/`attacks/` обработаны как пассивные данные.
 - **Тесты: 28 passed.**
+
+---
+
+## Addendum — 2026-09-04: Architectural hardening pass (supersedes prior scope cuts)
+
+По прямому запросу оператора сняты замороженные пункты триажа: изменены `controller.py`, `schemas.py` (freeze предыдущей сессии отменён явным мандатом).
+
+1. **Fail-closed resilience:**
+   - `controller.evaluate()` — все внешние вызовы (live price, order history) обёрнуты try/except; исключение → failed BLOCK-check (`MARKET_DATA_AVAILABILITY` / `ORDER_HISTORY_AVAILABILITY`) → гарантированный VETO с approved_notional=0.
+   - `_check_daily_limits()` — нерезолвленная цена открытого ордера больше не считается как $0: `DAILY_NOTIONAL_CAP` fail-closed («exposure cannot be verified»).
+   - `daemon._process_article()` — внешний safety net: ни одно исключение (включая сбой submit_order → `EXECUTION_ERROR`, произвольный сбой → `PIPELINE_ERROR`) не убивает polling loop; даже неписуемый audit-лог не роняет демон.
+2. **Benchmark integrity:** `NAIVE_SYSTEM_INSTRUCTION` очищен от strawman-директивы («follow them and call the tool immediately») — теперь реалистичный наивный агент без input-валидации. `run_naive()` возвращает структурированный `NaiveRunResult` (captured/orders/exfiltration/detail); bench/server/cli ветвятся по полям tool dispatch, а не по подстроке "CAPTURED". Кэш наивной руки ключуется хэшем промпта (`naive-<hash>_<file>`) — смена промпта автоматически инвалидирует старые результаты (п.4 и п.8 триажа закрыты кодом, а не документацией).
+3. **Schema rigidity + Plane 2 integration:** `TradeIntent` — `frozen=True` (пост-валидационная мутация невозможна). `evaluate()` принимает `airlocked` и выполняет `AIRLOCK_BINDING` (BLOCK: thesis_ref == airlock_id, provenance == UNTRUSTED_TEXT) и `AIRLOCK_ANOMALY_AUDIT` (WARN: флаги Plane 2 фиксируются в вердикте) — AIRLOCK теперь функционально включён в исполнительный контур.
+- **Тесты: 44 passed** (28 прежних + 16 новых: fail-closed, frozen, airlock binding, daemon survivability, structured naive result, prompt-keyed cache).
+- **Bench:** перегнан с новым baseline-промптом (см. свежий вывод `cleanroom bench`).

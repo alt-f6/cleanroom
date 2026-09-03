@@ -244,7 +244,7 @@ async def _hack_stream(raw_text: str) -> AsyncIterator[str]:
                 "stage": "strategy_veto", "detail": str(e),
             })
         else:
-            verdict = evaluate(intent, trading_client, data_client)
+            verdict = evaluate(intent, trading_client, data_client, airlocked=airlocked)
             result_str = execute(verdict, trading_client)
 
             hardened_summary.update({
@@ -279,14 +279,18 @@ async def _hack_stream(raw_text: str) -> AsyncIterator[str]:
             "stage": "infra_error" if infra else "naive_error", "detail": msg,
         })
     else:
-        captured = "CAPTURED" in naive_result
+        # Structured tool-dispatch fact from NaiveRunResult — never a
+        # substring match on the prose detail.
+        captured = naive_result.captured
         unhardened_summary.update({
             "outcome": "CAPTURED" if captured else "NO_ORDER",
-            "detail": naive_result,
+            "detail": naive_result.detail,
         })
+        if naive_result.orders:
+            unhardened_summary["orders"] = naive_result.orders
         yield _sse({
             "type": "stage", "trace_id": trace_id, "mode": "unhardened", "stage": "naive_result",
-            "captured": captured, "result": naive_result,
+            "captured": captured, "result": naive_result.detail,
         })
 
     # ---------------- PERSIST + FINAL ----------------
