@@ -348,7 +348,7 @@ def run_unhardened_file(path: Path) -> FileResult:
 # MCP tool-description-poisoning class has no delivery surface on the
 # hardened side to begin with), and that Perception's module has no code
 # path to broker submission. Kept separate from the ASR table on purpose —
-# see the discussion in CLEANROOM_SPEC.md and cli.py's bench docstring.
+# see the discussion in the architectural specification and cli.py's bench docstring.
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class IsolationCheck:

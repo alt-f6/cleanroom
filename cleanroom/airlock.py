@@ -26,7 +26,8 @@ from cleanroom.schemas import (
 # anyone reading the log. The actual security guarantee lives in the
 # tool-boundary (Perception has no tools) and in the Controller's
 # invariants, not in this keyword list. Do not extend this into a
-# detection arms race; that is explicitly out of scope (see spec §1).
+# detection arms race; that is explicitly out of scope (see the
+# architectural specification).
 _INJECTION_MARKERS = (
     "system:",
     "system override",
